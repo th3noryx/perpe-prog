@@ -83,6 +83,30 @@ pub mod perpe {
         Ok(())
     }
 
+    pub fn close_market(ctx: Context<CloseMarket>) -> Result<()> {
+        require!(
+            ctx.accounts.admin.key() == ctx.accounts.protocol.admin,
+            ErrorCode::Unauthorized
+        );
+        
+        let market = &ctx.accounts.market;
+        let lending = &ctx.accounts.lending_pool;
+        
+        // Check no open positions
+        require!(market.total_positions == 0, ErrorCode::MarketHasPositions);
+        
+        // Check no borrowed tokens
+        require!(lending.total_borrowed == 0, ErrorCode::MarketHasBorrows);
+        
+        // Accounts will be closed automatically via close = admin
+        
+        emit!(MarketClosed {
+            token_mint: market.token_mint,
+        });
+        
+        Ok(())
+    }
+
     pub fn unwrap_wsol(ctx: Context<UnwrapWsol>) -> Result<()> {
         let vault_bump = ctx.accounts.protocol.vault_bump;
         let seeds: &[&[u8]] = &[b"protocol_vault", &[vault_bump]];
@@ -1164,6 +1188,46 @@ pub struct CreateWsolVault<'info> {
 }
 
 #[derive(Accounts)]
+pub struct CloseMarket<'info> {
+    #[account(mut)]
+    pub admin: Signer<'info>,
+
+    #[account(seeds = [b"protocol"], bump = protocol.bump, has_one = admin)]
+    pub protocol: Account<'info, Protocol>,
+
+    /// CHECK: Protocol vault
+    #[account(seeds = [b"protocol_vault"], bump = protocol.vault_bump)]
+    pub protocol_vault: AccountInfo<'info>,
+
+    #[account(
+        mut,
+        close = admin,
+        seeds = [b"market", market.token_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Account<'info, Market>,
+
+    #[account(
+        mut,
+        close = admin,
+        seeds = [b"lending_pool", market.key().as_ref()],
+        bump = lending_pool.bump,
+    )]
+    pub lending_pool: Account<'info, LendingPool>,
+
+    #[account(
+        mut,
+        associated_token::mint = token_mint,
+        associated_token::authority = protocol_vault,
+    )]
+    pub token_vault: Account<'info, TokenAccount>,
+
+    pub token_mint: Account<'info, Mint>,
+    pub token_program: Program<'info, Token>,
+}
+
+
+#[derive(Accounts)]
 pub struct CreateMarket<'info> {
     #[account(mut)]
     pub admin: Signer<'info>,
@@ -1571,6 +1635,11 @@ pub struct LendingDeposited { pub user: Pubkey, pub amount: u64, pub shares: u64
 pub struct LendingWithdrawn { pub user: Pubkey, pub tokens: u64, pub shares: u64 }
 
 #[event]
+pub struct MarketClosed {
+    pub token_mint: Pubkey,
+}
+
+#[event]
 pub struct PositionOpened {
     pub owner: Pubkey,
     pub market: Pubkey,
@@ -1638,4 +1707,8 @@ pub enum ErrorCode {
     PositionTooLarge,
     #[msg("Invalid pumpswap accounts in remaining_accounts")]
     InvalidPumpswapAccounts,
+    #[msg("Market has open positions")]
+    MarketHasPositions,
+    #[msg("Market has borrowed tokens")]
+    MarketHasBorrows,
 }
