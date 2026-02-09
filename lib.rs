@@ -79,6 +79,23 @@ pub mod perpe {
         Ok(())
     }
 
+    pub fn update_market(ctx: Context<UpdateMarket>, new_max_position_size: u64) -> Result<()> {
+        require!(
+            ctx.accounts.admin.key() == ctx.accounts.protocol.admin,
+            ErrorCode::Unauthorized
+        );
+    
+        ctx.accounts.market.max_position_size = new_max_position_size;
+    
+        emit!(MarketUpdated {
+            token_mint: ctx.accounts.market.token_mint,
+            max_position_size: new_max_position_size,
+        });
+    
+        Ok(())
+    }
+    
+
     pub fn create_wsol_vault(_ctx: Context<CreateWsolVault>) -> Result<()> {
         Ok(())
     }
@@ -353,10 +370,17 @@ pub mod perpe {
                 slippage_limit,
             )?;
 
+            let actual_entry_price = (position_size_sol as u128)
+                .checked_mul(PRECISION)
+                .ok_or(ErrorCode::Overflow)?
+                .checked_div(tokens as u128)
+                .ok_or(ErrorCode::Overflow)? as u64;
+        
             position.token_amount = tokens;
             position.position_size_sol = position_size_sol;
             position.borrowed_tokens = 0;
-            position.liquidation_price = calc_liq_price_long(entry_price, leverage)?;
+            position.entry_price = actual_entry_price;
+            position.liquidation_price = calc_liq_price_long(actual_entry_price, leverage)?;
 
             let market = &mut ctx.accounts.market;
             market.total_long_collateral = market.total_long_collateral
@@ -403,10 +427,17 @@ pub mod perpe {
                 slippage_limit,
             )?;
 
+            let actual_entry_price = (sol_received as u128)
+                .checked_mul(PRECISION)
+                .ok_or(ErrorCode::Overflow)?
+                .checked_div(tokens_to_borrow as u128)
+                .ok_or(ErrorCode::Overflow)? as u64;
+    
             position.token_amount = 0;
             position.position_size_sol = sol_received;
             position.borrowed_tokens = tokens_to_borrow;
-            position.liquidation_price = calc_liq_price_short(entry_price, leverage)?;
+            position.entry_price = actual_entry_price;
+            position.liquidation_price = calc_liq_price_short(actual_entry_price, leverage)?;
 
             let market = &mut ctx.accounts.market;
             market.total_short_collateral = market.total_short_collateral
@@ -422,7 +453,7 @@ pub mod perpe {
             is_long,
             collateral: collateral_after_fee,
             leverage,
-            entry_price,
+            entry_price: position.entry_price,
             liquidation_price: position.liquidation_price,
         });
 
@@ -1159,6 +1190,21 @@ pub struct UnwrapWsol<'info> {
 }
 
 #[derive(Accounts)]
+pub struct UpdateMarket<'info> {
+    pub admin: Signer<'info>,
+
+    #[account(seeds = [b"protocol"], bump = protocol.bump, has_one = admin)]
+    pub protocol: Account<'info, Protocol>,
+
+    #[account(
+        mut,
+        seeds = [b"market", market.token_mint.as_ref()],
+        bump = market.bump,
+    )]
+    pub market: Account<'info, Market>,
+}
+
+#[derive(Accounts)]
 pub struct CreateWsolVault<'info> {
     #[account(mut)]
     pub payer: Signer<'info>,
@@ -1619,6 +1665,12 @@ pub struct ProtocolInitialized { pub admin: Pubkey }
 pub struct MarketCreated { 
     pub token_mint: Pubkey, 
     pub pumpswap_pool: Pubkey,
+    pub max_position_size: u64,
+}
+
+#[event]
+pub struct MarketUpdated {
+    pub token_mint: Pubkey,
     pub max_position_size: u64,
 }
 
