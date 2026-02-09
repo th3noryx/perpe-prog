@@ -1,6 +1,7 @@
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program::{program::invoke_signed, instruction::Instruction};
-use anchor_spl::token::{self, Token, TokenAccount, Mint, Transfer, SyncNative};
+use anchor_spl::token::{self, Token, SyncNative};
+use anchor_spl::token_interface::{self, TokenInterface, TokenAccount, Mint, TransferChecked};
 use anchor_spl::associated_token::AssociatedToken;
 
 declare_id!("perpmwcaoweY2WNxviUKrJPCAvLaNHGESXZGZgiDVDS");
@@ -36,6 +37,7 @@ pub mod perpe {
         emit!(ProtocolInitialized { admin: protocol.admin });
         Ok(())
     }
+
     pub fn create_market(ctx: Context<CreateMarket>, max_position_size: u64) -> Result<()> {
         require!(
             ctx.accounts.admin.key() == ctx.accounts.protocol.admin,
@@ -59,7 +61,8 @@ pub mod perpe {
         market.total_long_collateral = 0;
         market.total_short_collateral = 0;
         market.total_positions = 0;
-        market.max_position_size = max_position_size;  // NEW
+        market.max_position_size = max_position_size;
+        market.token_decimals = ctx.accounts.token_mint.decimals;
         market.bump = ctx.bumps.market;
 
         let lending = &mut ctx.accounts.lending_pool;
@@ -73,7 +76,7 @@ pub mod perpe {
         emit!(MarketCreated {
             token_mint: market.token_mint,
             pumpswap_pool: market.pumpswap_pool,
-            max_position_size,  // NEW
+            max_position_size,
         });
     
         Ok(())
@@ -94,7 +97,6 @@ pub mod perpe {
     
         Ok(())
     }
-    
 
     pub fn create_wsol_vault(_ctx: Context<CreateWsolVault>) -> Result<()> {
         Ok(())
@@ -109,13 +111,8 @@ pub mod perpe {
         let market = &ctx.accounts.market;
         let lending = &ctx.accounts.lending_pool;
         
-        // Check no open positions
         require!(market.total_positions == 0, ErrorCode::MarketHasPositions);
-        
-        // Check no borrowed tokens
         require!(lending.total_borrowed == 0, ErrorCode::MarketHasBorrows);
-        
-        // Accounts will be closed automatically via close = admin
         
         emit!(MarketClosed {
             token_mint: market.token_mint,
@@ -147,7 +144,6 @@ pub mod perpe {
     pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
         require!(amount > 0, ErrorCode::ZeroAmount);
 
-        // Transfer SOL to protocol_vault
         anchor_lang::system_program::transfer(
             CpiContext::new(
                 ctx.accounts.system_program.to_account_info(),
@@ -159,7 +155,6 @@ pub mod perpe {
             amount,
         )?;
 
-        // Update user's balance record
         let user_account = &mut ctx.accounts.user_account;
         user_account.owner = ctx.accounts.user.key();
         user_account.balance = user_account.balance.checked_add(amount).ok_or(ErrorCode::Overflow)?;
@@ -180,7 +175,6 @@ pub mod perpe {
         let new_balance = ctx.accounts.user_account.balance.checked_sub(amount).ok_or(ErrorCode::Overflow)?;
         ctx.accounts.user_account.balance = new_balance;
 
-        // Transfer SOL from protocol_vault to user
         let vault_bump = ctx.accounts.protocol.vault_bump;
         let seeds: &[&[u8]] = &[b"protocol_vault", &[vault_bump]];
         let signer_seeds = &[seeds];
@@ -210,6 +204,7 @@ pub mod perpe {
         require!(amount > 0, ErrorCode::ZeroAmount);
 
         let lending = &mut ctx.accounts.lending_pool;
+        let decimals = ctx.accounts.token_mint.decimals;
 
         let shares = if lending.total_deposits == 0 {
             amount
@@ -221,16 +216,18 @@ pub mod perpe {
                 .ok_or(ErrorCode::Overflow)? as u64
         };
 
-        token::transfer(
+        token_interface::transfer_checked(
             CpiContext::new(
                 ctx.accounts.token_program.to_account_info(),
-                Transfer {
+                TransferChecked {
                     from: ctx.accounts.user_token_account.to_account_info(),
+                    mint: ctx.accounts.token_mint.to_account_info(),
                     to: ctx.accounts.token_vault.to_account_info(),
                     authority: ctx.accounts.user.to_account_info(),
                 },
             ),
             amount,
+            decimals,
         )?;
 
         lending.total_deposits = lending.total_deposits.checked_add(amount).ok_or(ErrorCode::Overflow)?;
@@ -256,6 +253,7 @@ pub mod perpe {
         require!(lender.shares >= shares, ErrorCode::InsufficientShares);
 
         let lending = &mut ctx.accounts.lending_pool;
+        let decimals = ctx.accounts.token_mint.decimals;
 
         let tokens = (shares as u128)
             .checked_mul(lending.total_deposits as u128)
@@ -270,17 +268,19 @@ pub mod perpe {
         let seeds: &[&[u8]] = &[b"protocol_vault", &[vault_bump]];
         let signer_seeds = &[seeds];
 
-        token::transfer(
+        token_interface::transfer_checked(
             CpiContext::new_with_signer(
                 ctx.accounts.token_program.to_account_info(),
-                Transfer {
+                TransferChecked {
                     from: ctx.accounts.token_vault.to_account_info(),
+                    mint: ctx.accounts.token_mint.to_account_info(),
                     to: ctx.accounts.user_token_account.to_account_info(),
                     authority: ctx.accounts.protocol_vault.to_account_info(),
                 },
                 signer_seeds,
             ),
             tokens,
+            decimals,
         )?;
 
         lending.total_deposits = lending.total_deposits.saturating_sub(tokens);
@@ -318,7 +318,6 @@ pub mod perpe {
             ErrorCode::PositionTooLarge
         );
 
-        // Parse pumpswap accounts from remaining_accounts
         let pump = parse_pumpswap_accounts(ctx.remaining_accounts)?;
 
         user_account.balance = user_account.balance.checked_sub(collateral).ok_or(ErrorCode::Overflow)?;
@@ -343,13 +342,13 @@ pub mod perpe {
         if is_long {
             let tokens = execute_buy(
                 &ctx.accounts.protocol_vault,
-                &mut ctx.accounts.token_vault,
-                &mut ctx.accounts.wsol_vault,
+                &ctx.accounts.token_vault,
+                &ctx.accounts.wsol_vault,
                 pump.pumpswap_pool,
                 pump.pool_base_vault,
                 pump.pool_quote_vault,
                 pump.pumpswap_global,
-                &ctx.accounts.token_mint,
+                &ctx.accounts.token_mint.to_account_info(),
                 &ctx.accounts.wsol_mint,
                 pump.protocol_fee_recipient,
                 pump.protocol_fee_recipient_ata,
@@ -359,8 +358,8 @@ pub mod perpe {
                 pump.user_volume_accumulator,
                 pump.fee_config,
                 pump.fee_program,
-                &ctx.accounts.token_program,
-                pump.token_program_2022,
+                &ctx.accounts.quote_token_program,
+                &ctx.accounts.base_token_program.to_account_info(),
                 &ctx.accounts.system_program,
                 &ctx.accounts.associated_token_program,
                 pump.event_authority,
@@ -402,13 +401,13 @@ pub mod perpe {
 
             let sol_received = execute_sell(
                 &ctx.accounts.protocol_vault,
-                &mut ctx.accounts.token_vault,
-                &mut ctx.accounts.wsol_vault,
+                &ctx.accounts.token_vault,
+                &ctx.accounts.wsol_vault,
                 pump.pumpswap_pool,
                 pump.pool_base_vault,
                 pump.pool_quote_vault,
                 pump.pumpswap_global,
-                &ctx.accounts.token_mint,
+                &ctx.accounts.token_mint.to_account_info(),
                 &ctx.accounts.wsol_mint,
                 pump.protocol_fee_recipient,
                 pump.protocol_fee_recipient_ata,
@@ -416,8 +415,8 @@ pub mod perpe {
                 pump.coin_creator_vault_authority,
                 pump.fee_config,
                 pump.fee_program,
-                &ctx.accounts.token_program,
-                pump.token_program_2022,
+                &ctx.accounts.quote_token_program,
+                &ctx.accounts.base_token_program.to_account_info(),
                 &ctx.accounts.system_program,
                 &ctx.accounts.associated_token_program,
                 pump.event_authority,
@@ -465,8 +464,6 @@ pub mod perpe {
         slippage_limit: u64,
     ) -> Result<()> {
         let position = &ctx.accounts.position;
-        
-        // Parse pumpswap accounts from remaining_accounts
         let pump = parse_pumpswap_accounts(ctx.remaining_accounts)?;
 
         let current_price = get_pool_price(
@@ -481,13 +478,13 @@ pub mod perpe {
         if position.is_long {
             let sol_received = execute_sell(
                 &ctx.accounts.protocol_vault,
-                &mut ctx.accounts.token_vault,
-                &mut ctx.accounts.wsol_vault,
+                &ctx.accounts.token_vault,
+                &ctx.accounts.wsol_vault,
                 pump.pumpswap_pool,
                 pump.pool_base_vault,
                 pump.pool_quote_vault,
                 pump.pumpswap_global,
-                &ctx.accounts.token_mint,
+                &ctx.accounts.token_mint.to_account_info(),
                 &ctx.accounts.wsol_mint,
                 pump.protocol_fee_recipient,
                 pump.protocol_fee_recipient_ata,
@@ -495,8 +492,8 @@ pub mod perpe {
                 pump.coin_creator_vault_authority,
                 pump.fee_config,
                 pump.fee_program,
-                &ctx.accounts.token_program,
-                pump.token_program_2022,
+                &ctx.accounts.quote_token_program,
+                &ctx.accounts.base_token_program.to_account_info(),
                 &ctx.accounts.system_program,
                 &ctx.accounts.associated_token_program,
                 pump.event_authority,
@@ -521,13 +518,13 @@ pub mod perpe {
 
             let sol_spent = execute_buy_for_close(
                 &ctx.accounts.protocol_vault,
-                &mut ctx.accounts.token_vault,
-                &mut ctx.accounts.wsol_vault,
+                &ctx.accounts.token_vault,
+                &ctx.accounts.wsol_vault,
                 pump.pumpswap_pool,
                 pump.pool_base_vault,
                 pump.pool_quote_vault,
                 pump.pumpswap_global,
-                &ctx.accounts.token_mint,
+                &ctx.accounts.token_mint.to_account_info(),
                 &ctx.accounts.wsol_mint,
                 pump.protocol_fee_recipient,
                 pump.protocol_fee_recipient_ata,
@@ -537,8 +534,8 @@ pub mod perpe {
                 pump.user_volume_accumulator,
                 pump.fee_config,
                 pump.fee_program,
-                &ctx.accounts.token_program,
-                pump.token_program_2022,
+                &ctx.accounts.quote_token_program,
+                &ctx.accounts.base_token_program.to_account_info(),
                 &ctx.accounts.system_program,
                 &ctx.accounts.associated_token_program,
                 pump.event_authority,
@@ -586,8 +583,6 @@ pub mod perpe {
         slippage_limit: u64,
     ) -> Result<()> {
         let position = &ctx.accounts.position;
-
-        // Parse pumpswap accounts from remaining_accounts
         let pump = parse_pumpswap_accounts(ctx.remaining_accounts)?;
 
         let current_price = get_pool_price(
@@ -607,13 +602,13 @@ pub mod perpe {
         if position.is_long {
             let sol_received = execute_sell(
                 &ctx.accounts.protocol_vault,
-                &mut ctx.accounts.token_vault,
-                &mut ctx.accounts.wsol_vault,
+                &ctx.accounts.token_vault,
+                &ctx.accounts.wsol_vault,
                 pump.pumpswap_pool,
                 pump.pool_base_vault,
                 pump.pool_quote_vault,
                 pump.pumpswap_global,
-                &ctx.accounts.token_mint,
+                &ctx.accounts.token_mint.to_account_info(),
                 &ctx.accounts.wsol_mint,
                 pump.protocol_fee_recipient,
                 pump.protocol_fee_recipient_ata,
@@ -621,8 +616,8 @@ pub mod perpe {
                 pump.coin_creator_vault_authority,
                 pump.fee_config,
                 pump.fee_program,
-                &ctx.accounts.token_program,
-                pump.token_program_2022,
+                &ctx.accounts.quote_token_program,
+                &ctx.accounts.base_token_program.to_account_info(),
                 &ctx.accounts.system_program,
                 &ctx.accounts.associated_token_program,
                 pump.event_authority,
@@ -643,13 +638,13 @@ pub mod perpe {
 
             let sol_spent = execute_buy_for_close(
                 &ctx.accounts.protocol_vault,
-                &mut ctx.accounts.token_vault,
-                &mut ctx.accounts.wsol_vault,
+                &ctx.accounts.token_vault,
+                &ctx.accounts.wsol_vault,
                 pump.pumpswap_pool,
                 pump.pool_base_vault,
                 pump.pool_quote_vault,
                 pump.pumpswap_global,
-                &ctx.accounts.token_mint,
+                &ctx.accounts.token_mint.to_account_info(),
                 &ctx.accounts.wsol_mint,
                 pump.protocol_fee_recipient,
                 pump.protocol_fee_recipient_ata,
@@ -659,8 +654,8 @@ pub mod perpe {
                 pump.user_volume_accumulator,
                 pump.fee_config,
                 pump.fee_program,
-                &ctx.accounts.token_program,
-                pump.token_program_2022,
+                &ctx.accounts.quote_token_program,
+                &ctx.accounts.base_token_program.to_account_info(),
                 &ctx.accounts.system_program,
                 &ctx.accounts.associated_token_program,
                 pump.event_authority,
@@ -713,7 +708,6 @@ pub mod perpe {
 
 // ========== Helper Functions ==========
 
-/// Pumpswap accounts extracted from remaining_accounts
 struct PumpswapAccounts<'a, 'info> {
     pumpswap_pool: &'a AccountInfo<'info>,
     pool_base_vault: &'a AccountInfo<'info>,
@@ -729,13 +723,12 @@ struct PumpswapAccounts<'a, 'info> {
     fee_program: &'a AccountInfo<'info>,
     event_authority: &'a AccountInfo<'info>,
     pumpswap_program: &'a AccountInfo<'info>,
-    token_program_2022: &'a AccountInfo<'info>,
 }
 
 fn parse_pumpswap_accounts<'a, 'info>(
     remaining: &'a [AccountInfo<'info>],
 ) -> Result<PumpswapAccounts<'a, 'info>> {
-    require!(remaining.len() >= 15, ErrorCode::InvalidPumpswapAccounts);
+    require!(remaining.len() >= 14, ErrorCode::InvalidPumpswapAccounts);
     Ok(PumpswapAccounts {
         pumpswap_pool: &remaining[0],
         pool_base_vault: &remaining[1],
@@ -751,7 +744,6 @@ fn parse_pumpswap_accounts<'a, 'info>(
         fee_program: &remaining[11],
         event_authority: &remaining[12],
         pumpswap_program: &remaining[13],
-        token_program_2022: &remaining[14],
     })
 }
 
@@ -796,16 +788,17 @@ fn calc_liq_price_short(entry_price: u64, leverage: u64) -> Result<u64> {
         .ok_or(ErrorCode::Overflow)? as u64;
     Ok(liq)
 }
+
 #[allow(clippy::too_many_arguments)]
 fn execute_buy<'info>(
     protocol_vault: &AccountInfo<'info>,
-    token_vault: &mut Account<'info, TokenAccount>,
-    wsol_vault: &mut Account<'info, TokenAccount>,
+    token_vault: &InterfaceAccount<'info, TokenAccount>,
+    wsol_vault: &InterfaceAccount<'info, TokenAccount>,
     pumpswap_pool: &AccountInfo<'info>,
     pool_base_vault: &AccountInfo<'info>,
     pool_quote_vault: &AccountInfo<'info>,
     pumpswap_global: &AccountInfo<'info>,
-    token_mint: &Account<'info, Mint>,
+    token_mint: &AccountInfo<'info>,
     wsol_mint: &AccountInfo<'info>,
     protocol_fee_recipient: &AccountInfo<'info>,
     protocol_fee_recipient_ata: &AccountInfo<'info>,
@@ -815,8 +808,8 @@ fn execute_buy<'info>(
     user_volume_accumulator: &AccountInfo<'info>,
     fee_config: &AccountInfo<'info>,
     fee_program: &AccountInfo<'info>,
-    token_program: &Program<'info, Token>,
-    token_program_2022: &AccountInfo<'info>,
+    quote_token_program: &Program<'info, Token>,
+    base_token_program: &AccountInfo<'info>,
     system_program: &Program<'info, System>,
     associated_token_program: &Program<'info, AssociatedToken>,
     event_authority: &AccountInfo<'info>,
@@ -829,7 +822,6 @@ fn execute_buy<'info>(
     let vault_seeds: &[&[u8]] = &[b"protocol_vault", vault_bump_slice];
     let vault_signer_seeds = &[vault_seeds];
 
-    // Transfer SOL from protocol_vault to wsol_vault (wrap SOL)
     anchor_lang::system_program::transfer(
         CpiContext::new_with_signer(
             system_program.to_account_info(),
@@ -844,7 +836,7 @@ fn execute_buy<'info>(
 
     token::sync_native(
         CpiContext::new(
-            token_program.to_account_info(),
+            quote_token_program.to_account_info(),
             SyncNative {
                 account: wsol_vault.to_account_info(),
             },
@@ -855,25 +847,24 @@ fn execute_buy<'info>(
 
     let mut ix_data = Vec::with_capacity(25);
     ix_data.extend_from_slice(&BUY_DISCRIMINATOR);
-    ix_data.extend_from_slice(&min_tokens.to_le_bytes());  // base_amount_out
-    ix_data.extend_from_slice(&sol_amount.to_le_bytes());  // max_quote_amount_in
-    ix_data.push(0); // track_volume = false
+    ix_data.extend_from_slice(&min_tokens.to_le_bytes());
+    ix_data.extend_from_slice(&sol_amount.to_le_bytes());
+    ix_data.push(0);
 
-    // Account order per pumpswap IDL buy:
     let accounts = vec![
-        AccountMeta::new(pumpswap_pool.key(), false),           // pool
-        AccountMeta::new(protocol_vault.key(), true),            // user (signer)
-        AccountMeta::new_readonly(pumpswap_global.key(), false), // global_config
-        AccountMeta::new_readonly(token_mint.key(), false),      // base_mint
-        AccountMeta::new_readonly(wsol_mint.key(), false),       // quote_mint
-        AccountMeta::new(token_vault.key(), false),              // user_base_token_account
-        AccountMeta::new(wsol_vault.key(), false),               // user_quote_token_account
-        AccountMeta::new(pool_base_vault.key(), false),          // pool_base_token_account
-        AccountMeta::new(pool_quote_vault.key(), false),         // pool_quote_token_account
+        AccountMeta::new(pumpswap_pool.key(), false),
+        AccountMeta::new(protocol_vault.key(), true),
+        AccountMeta::new_readonly(pumpswap_global.key(), false),
+        AccountMeta::new_readonly(token_mint.key(), false),
+        AccountMeta::new_readonly(wsol_mint.key(), false),
+        AccountMeta::new(token_vault.key(), false),
+        AccountMeta::new(wsol_vault.key(), false),
+        AccountMeta::new(pool_base_vault.key(), false),
+        AccountMeta::new(pool_quote_vault.key(), false),
         AccountMeta::new_readonly(protocol_fee_recipient.key(), false),
         AccountMeta::new(protocol_fee_recipient_ata.key(), false),
-        AccountMeta::new_readonly(token_program_2022.key(), false),  // base_token_program
-        AccountMeta::new_readonly(token_program.key(), false),       // quote_token_program
+        AccountMeta::new_readonly(base_token_program.key(), false),
+        AccountMeta::new_readonly(quote_token_program.key(), false),
         AccountMeta::new_readonly(system_program.key(), false),
         AccountMeta::new_readonly(associated_token_program.key(), false),
         AccountMeta::new_readonly(event_authority.key(), false),
@@ -900,8 +891,8 @@ fn execute_buy<'info>(
             pool_quote_vault.to_account_info(),
             protocol_fee_recipient.to_account_info(),
             protocol_fee_recipient_ata.to_account_info(),
-            token_program_2022.to_account_info(),
-            token_program.to_account_info(),
+            base_token_program.to_account_info(),
+            quote_token_program.to_account_info(),
             system_program.to_account_info(),
             associated_token_program.to_account_info(),
             event_authority.to_account_info(),
@@ -916,8 +907,11 @@ fn execute_buy<'info>(
         vault_signer_seeds,
     )?;
 
-    token_vault.reload()?;
-    let tokens_after = token_vault.amount;
+    let token_vault_info = token_vault.to_account_info();
+    let token_vault_data = token_vault_info.try_borrow_data()?;
+    let tokens_after = u64::from_le_bytes(token_vault_data[TOKEN_AMOUNT_OFFSET..TOKEN_AMOUNT_OFFSET + 8].try_into().unwrap());
+    drop(token_vault_data);
+    
     let received = tokens_after.checked_sub(tokens_before).ok_or(ErrorCode::SwapFailed)?;
     require!(received >= min_tokens, ErrorCode::SlippageExceeded);
 
@@ -927,13 +921,13 @@ fn execute_buy<'info>(
 #[allow(clippy::too_many_arguments)]
 fn execute_sell<'info>(
     protocol_vault: &AccountInfo<'info>,
-    token_vault: &mut Account<'info, TokenAccount>,
-    wsol_vault: &mut Account<'info, TokenAccount>,
+    token_vault: &InterfaceAccount<'info, TokenAccount>,
+    wsol_vault: &InterfaceAccount<'info, TokenAccount>,
     pumpswap_pool: &AccountInfo<'info>,
     pool_base_vault: &AccountInfo<'info>,
     pool_quote_vault: &AccountInfo<'info>,
     pumpswap_global: &AccountInfo<'info>,
-    token_mint: &Account<'info, Mint>,
+    token_mint: &AccountInfo<'info>,
     wsol_mint: &AccountInfo<'info>,
     protocol_fee_recipient: &AccountInfo<'info>,
     protocol_fee_recipient_ata: &AccountInfo<'info>,
@@ -941,8 +935,8 @@ fn execute_sell<'info>(
     coin_creator_vault_authority: &AccountInfo<'info>,
     fee_config: &AccountInfo<'info>,
     fee_program: &AccountInfo<'info>,
-    token_program: &Program<'info, Token>,
-    token_program_2022: &AccountInfo<'info>,
+    quote_token_program: &Program<'info, Token>,
+    base_token_program: &AccountInfo<'info>,
     system_program: &Program<'info, System>,
     associated_token_program: &Program<'info, AssociatedToken>,
     event_authority: &AccountInfo<'info>,
@@ -974,8 +968,8 @@ fn execute_sell<'info>(
         AccountMeta::new(pool_quote_vault.key(), false),
         AccountMeta::new_readonly(protocol_fee_recipient.key(), false),
         AccountMeta::new(protocol_fee_recipient_ata.key(), false),
-        AccountMeta::new_readonly(token_program_2022.key(), false),
-        AccountMeta::new_readonly(token_program.key(), false),
+        AccountMeta::new_readonly(base_token_program.key(), false),
+        AccountMeta::new_readonly(quote_token_program.key(), false),
         AccountMeta::new_readonly(system_program.key(), false),
         AccountMeta::new_readonly(associated_token_program.key(), false),
         AccountMeta::new_readonly(event_authority.key(), false),
@@ -1000,8 +994,8 @@ fn execute_sell<'info>(
             pool_quote_vault.to_account_info(),
             protocol_fee_recipient.to_account_info(),
             protocol_fee_recipient_ata.to_account_info(),
-            token_program_2022.to_account_info(),
-            token_program.to_account_info(),
+            base_token_program.to_account_info(),
+            quote_token_program.to_account_info(),
             system_program.to_account_info(),
             associated_token_program.to_account_info(),
             event_authority.to_account_info(),
@@ -1014,8 +1008,11 @@ fn execute_sell<'info>(
         signer_seeds,
     )?;
 
-    wsol_vault.reload()?;
-    let wsol_after = wsol_vault.amount;
+    let wsol_vault_info = wsol_vault.to_account_info();
+    let wsol_vault_data = wsol_vault_info.try_borrow_data()?;
+    let wsol_after = u64::from_le_bytes(wsol_vault_data[TOKEN_AMOUNT_OFFSET..TOKEN_AMOUNT_OFFSET + 8].try_into().unwrap());
+    drop(wsol_vault_data);
+    
     let received = wsol_after.checked_sub(wsol_before).ok_or(ErrorCode::SwapFailed)?;
     require!(received >= min_sol, ErrorCode::SlippageExceeded);
 
@@ -1025,13 +1022,13 @@ fn execute_sell<'info>(
 #[allow(clippy::too_many_arguments)]
 fn execute_buy_for_close<'info>(
     protocol_vault: &AccountInfo<'info>,
-    token_vault: &mut Account<'info, TokenAccount>,
-    wsol_vault: &mut Account<'info, TokenAccount>,
+    token_vault: &InterfaceAccount<'info, TokenAccount>,
+    wsol_vault: &InterfaceAccount<'info, TokenAccount>,
     pumpswap_pool: &AccountInfo<'info>,
     pool_base_vault: &AccountInfo<'info>,
     pool_quote_vault: &AccountInfo<'info>,
     pumpswap_global: &AccountInfo<'info>,
-    token_mint: &Account<'info, Mint>,
+    token_mint: &AccountInfo<'info>,
     wsol_mint: &AccountInfo<'info>,
     protocol_fee_recipient: &AccountInfo<'info>,
     protocol_fee_recipient_ata: &AccountInfo<'info>,
@@ -1041,8 +1038,8 @@ fn execute_buy_for_close<'info>(
     user_volume_accumulator: &AccountInfo<'info>,
     fee_config: &AccountInfo<'info>,
     fee_program: &AccountInfo<'info>,
-    token_program: &Program<'info, Token>,
-    token_program_2022: &AccountInfo<'info>,
+    quote_token_program: &Program<'info, Token>,
+    base_token_program: &AccountInfo<'info>,
     system_program: &Program<'info, System>,
     associated_token_program: &Program<'info, AssociatedToken>,
     event_authority: &AccountInfo<'info>,
@@ -1075,8 +1072,8 @@ fn execute_buy_for_close<'info>(
         AccountMeta::new(pool_quote_vault.key(), false),
         AccountMeta::new_readonly(protocol_fee_recipient.key(), false),
         AccountMeta::new(protocol_fee_recipient_ata.key(), false),
-        AccountMeta::new_readonly(token_program_2022.key(), false),
-        AccountMeta::new_readonly(token_program.key(), false),
+        AccountMeta::new_readonly(base_token_program.key(), false),
+        AccountMeta::new_readonly(quote_token_program.key(), false),
         AccountMeta::new_readonly(system_program.key(), false),
         AccountMeta::new_readonly(associated_token_program.key(), false),
         AccountMeta::new_readonly(event_authority.key(), false),
@@ -1103,8 +1100,8 @@ fn execute_buy_for_close<'info>(
             pool_quote_vault.to_account_info(),
             protocol_fee_recipient.to_account_info(),
             protocol_fee_recipient_ata.to_account_info(),
-            token_program_2022.to_account_info(),
-            token_program.to_account_info(),
+            base_token_program.to_account_info(),
+            quote_token_program.to_account_info(),
             system_program.to_account_info(),
             associated_token_program.to_account_info(),
             event_authority.to_account_info(),
@@ -1119,8 +1116,11 @@ fn execute_buy_for_close<'info>(
         signer_seeds,
     )?;
 
-    wsol_vault.reload()?;
-    let wsol_after = wsol_vault.amount;
+    let wsol_vault_info = wsol_vault.to_account_info();
+    let wsol_vault_data = wsol_vault_info.try_borrow_data()?;
+    let wsol_after = u64::from_le_bytes(wsol_vault_data[TOKEN_AMOUNT_OFFSET..TOKEN_AMOUNT_OFFSET + 8].try_into().unwrap());
+    drop(wsol_vault_data);
+    
     let spent = wsol_before.checked_sub(wsol_after).ok_or(ErrorCode::SwapFailed)?;
     require!(spent <= max_sol, ErrorCode::SlippageExceeded);
 
@@ -1144,11 +1144,7 @@ pub struct Initialize<'info> {
     pub protocol: Box<Account<'info, Protocol>>,
 
     /// CHECK: Global vault PDA
-    #[account(
-        mut,
-        seeds = [b"protocol_vault"],
-        bump,
-    )]
+    #[account(mut, seeds = [b"protocol_vault"], bump)]
     pub protocol_vault: AccountInfo<'info>,
 
     #[account(
@@ -1157,7 +1153,7 @@ pub struct Initialize<'info> {
         associated_token::mint = wsol_mint,
         associated_token::authority = protocol_vault,
     )]
-    pub wsol_vault: Box<Account<'info, TokenAccount>>,
+    pub wsol_vault: Box<InterfaceAccount<'info, TokenAccount>>,
 
     /// CHECK: WSOL mint
     #[account(address = WSOL_MINT)]
@@ -1180,7 +1176,7 @@ pub struct UnwrapWsol<'info> {
     pub protocol_vault: AccountInfo<'info>,
 
     #[account(mut, associated_token::mint = wsol_mint, associated_token::authority = protocol_vault)]
-    pub wsol_vault: Account<'info, TokenAccount>,
+    pub wsol_vault: InterfaceAccount<'info, TokenAccount>,
 
     /// CHECK: WSOL mint
     #[account(address = WSOL_MINT)]
@@ -1196,11 +1192,7 @@ pub struct UpdateMarket<'info> {
     #[account(seeds = [b"protocol"], bump = protocol.bump, has_one = admin)]
     pub protocol: Account<'info, Protocol>,
 
-    #[account(
-        mut,
-        seeds = [b"market", market.token_mint.as_ref()],
-        bump = market.bump,
-    )]
+    #[account(mut, seeds = [b"market", market.token_mint.as_ref()], bump = market.bump)]
     pub market: Account<'info, Market>,
 }
 
@@ -1222,7 +1214,7 @@ pub struct CreateWsolVault<'info> {
         associated_token::mint = wsol_mint,
         associated_token::authority = protocol_vault,
     )]
-    pub wsol_vault: Account<'info, TokenAccount>,
+    pub wsol_vault: InterfaceAccount<'info, TokenAccount>,
 
     /// CHECK: WSOL mint
     #[account(address = WSOL_MINT)]
@@ -1245,33 +1237,23 @@ pub struct CloseMarket<'info> {
     #[account(seeds = [b"protocol_vault"], bump = protocol.vault_bump)]
     pub protocol_vault: AccountInfo<'info>,
 
-    #[account(
-        mut,
-        close = admin,
-        seeds = [b"market", market.token_mint.as_ref()],
-        bump = market.bump,
-    )]
+    #[account(mut, close = admin, seeds = [b"market", market.token_mint.as_ref()], bump = market.bump)]
     pub market: Account<'info, Market>,
 
-    #[account(
-        mut,
-        close = admin,
-        seeds = [b"lending_pool", market.key().as_ref()],
-        bump = lending_pool.bump,
-    )]
+    #[account(mut, close = admin, seeds = [b"lending_pool", market.key().as_ref()], bump = lending_pool.bump)]
     pub lending_pool: Account<'info, LendingPool>,
 
     #[account(
         mut,
         associated_token::mint = token_mint,
         associated_token::authority = protocol_vault,
+        associated_token::token_program = token_program,
     )]
-    pub token_vault: Account<'info, TokenAccount>,
+    pub token_vault: InterfaceAccount<'info, TokenAccount>,
 
-    pub token_mint: Account<'info, Mint>,
-    pub token_program: Program<'info, Token>,
+    pub token_mint: InterfaceAccount<'info, Mint>,
+    pub token_program: Interface<'info, TokenInterface>,
 }
-
 
 #[derive(Accounts)]
 pub struct CreateMarket<'info> {
@@ -1285,7 +1267,7 @@ pub struct CreateMarket<'info> {
     #[account(seeds = [b"protocol_vault"], bump = protocol.vault_bump)]
     pub protocol_vault: AccountInfo<'info>,
 
-    pub token_mint: Box<Account<'info, Mint>>,
+    pub token_mint: Box<InterfaceAccount<'info, Mint>>,
 
     #[account(
         init, payer = admin, space = 8 + Market::INIT_SPACE,
@@ -1300,16 +1282,18 @@ pub struct CreateMarket<'info> {
     pub lending_pool: Box<Account<'info, LendingPool>>,
 
     #[account(
-        init, payer = admin,
+        init_if_needed,
+        payer = admin,
         associated_token::mint = token_mint,
         associated_token::authority = protocol_vault,
+        associated_token::token_program = token_program,
     )]
-    pub token_vault: Box<Account<'info, TokenAccount>>,
+    pub token_vault: Box<InterfaceAccount<'info, TokenAccount>>,
 
     /// CHECK: Pumpswap pool
     pub pumpswap_pool: AccountInfo<'info>,
 
-    pub token_program: Program<'info, Token>,
+    pub token_program: Interface<'info, TokenInterface>,
     pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,
 }
@@ -1382,14 +1366,19 @@ pub struct DepositToLending<'info> {
     )]
     pub lender_position: Box<Account<'info, LenderPosition>>,
 
-    #[account(mut, associated_token::mint = token_mint, associated_token::authority = protocol_vault)]
-    pub token_vault: Box<Account<'info, TokenAccount>>,
+    #[account(
+        mut,
+        associated_token::mint = token_mint,
+        associated_token::authority = protocol_vault,
+        associated_token::token_program = token_program,
+    )]
+    pub token_vault: Box<InterfaceAccount<'info, TokenAccount>>,
 
     #[account(mut)]
-    pub user_token_account: Box<Account<'info, TokenAccount>>,
+    pub user_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
 
-    pub token_mint: Box<Account<'info, Mint>>,
-    pub token_program: Program<'info, Token>,
+    pub token_mint: Box<InterfaceAccount<'info, Mint>>,
+    pub token_program: Interface<'info, TokenInterface>,
     pub system_program: Program<'info, System>,
 }
 
@@ -1418,14 +1407,19 @@ pub struct WithdrawFromLending<'info> {
     )]
     pub lender_position: Box<Account<'info, LenderPosition>>,
 
-    #[account(mut, associated_token::mint = token_mint, associated_token::authority = protocol_vault)]
-    pub token_vault: Box<Account<'info, TokenAccount>>,
+    #[account(
+        mut,
+        associated_token::mint = token_mint,
+        associated_token::authority = protocol_vault,
+        associated_token::token_program = token_program,
+    )]
+    pub token_vault: Box<InterfaceAccount<'info, TokenAccount>>,
 
     #[account(mut)]
-    pub user_token_account: Box<Account<'info, TokenAccount>>,
+    pub user_token_account: Box<InterfaceAccount<'info, TokenAccount>>,
 
-    pub token_mint: Box<Account<'info, Mint>>,
-    pub token_program: Program<'info, Token>,
+    pub token_mint: Box<InterfaceAccount<'info, Mint>>,
+    pub token_program: Interface<'info, TokenInterface>,
 }
 
 #[derive(Accounts)]
@@ -1449,11 +1443,16 @@ pub struct OpenPosition<'info> {
     #[account(mut, seeds = [b"lending_pool", market.key().as_ref()], bump = lending_pool.bump)]
     pub lending_pool: Box<Account<'info, LendingPool>>,
 
-    #[account(mut, associated_token::mint = token_mint, associated_token::authority = protocol_vault)]
-    pub token_vault: Box<Account<'info, TokenAccount>>,
+    #[account(
+        mut,
+        associated_token::mint = token_mint,
+        associated_token::authority = protocol_vault,
+        associated_token::token_program = base_token_program,
+    )]
+    pub token_vault: Box<InterfaceAccount<'info, TokenAccount>>,
 
     #[account(mut, associated_token::mint = wsol_mint, associated_token::authority = protocol_vault)]
-    pub wsol_vault: Box<Account<'info, TokenAccount>>,
+    pub wsol_vault: Box<InterfaceAccount<'info, TokenAccount>>,
 
     #[account(
         init, payer = user, space = 8 + Position::INIT_SPACE,
@@ -1461,31 +1460,16 @@ pub struct OpenPosition<'info> {
     )]
     pub position: Box<Account<'info, Position>>,
 
-    pub token_mint: Box<Account<'info, Mint>>,
+    pub token_mint: Box<InterfaceAccount<'info, Mint>>,
 
     /// CHECK: WSOL mint
     #[account(address = WSOL_MINT)]
     pub wsol_mint: AccountInfo<'info>,
 
-    pub token_program: Program<'info, Token>,
+    pub base_token_program: Interface<'info, TokenInterface>,
+    pub quote_token_program: Program<'info, Token>,
     pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,
-    // Pumpswap accounts passed via remaining_accounts:
-    // [0] pumpswap_pool (mut)
-    // [1] pool_base_vault (mut)
-    // [2] pool_quote_vault (mut)
-    // [3] pumpswap_global
-    // [4] protocol_fee_recipient
-    // [5] protocol_fee_recipient_ata (mut)
-    // [6] coin_creator_vault_ata (mut)
-    // [7] coin_creator_vault_authority
-    // [8] global_volume_accumulator
-    // [9] user_volume_accumulator (mut)
-    // [10] fee_config
-    // [11] fee_program
-    // [12] event_authority
-    // [13] pumpswap_program
-    // [14] token_program_2022
 }
 
 #[derive(Accounts)]
@@ -1513,11 +1497,16 @@ pub struct ClosePosition<'info> {
     #[account(mut, seeds = [b"lending_pool", market.key().as_ref()], bump = lending_pool.bump)]
     pub lending_pool: Box<Account<'info, LendingPool>>,
 
-    #[account(mut, associated_token::mint = token_mint, associated_token::authority = protocol_vault)]
-    pub token_vault: Box<Account<'info, TokenAccount>>,
+    #[account(
+        mut,
+        associated_token::mint = token_mint,
+        associated_token::authority = protocol_vault,
+        associated_token::token_program = base_token_program,
+    )]
+    pub token_vault: Box<InterfaceAccount<'info, TokenAccount>>,
 
     #[account(mut, associated_token::mint = wsol_mint, associated_token::authority = protocol_vault)]
-    pub wsol_vault: Box<Account<'info, TokenAccount>>,
+    pub wsol_vault: Box<InterfaceAccount<'info, TokenAccount>>,
 
     #[account(
         mut, close = position_owner,
@@ -1527,16 +1516,16 @@ pub struct ClosePosition<'info> {
     )]
     pub position: Box<Account<'info, Position>>,
 
-    pub token_mint: Box<Account<'info, Mint>>,
+    pub token_mint: Box<InterfaceAccount<'info, Mint>>,
 
     /// CHECK: WSOL mint
     #[account(address = WSOL_MINT)]
     pub wsol_mint: AccountInfo<'info>,
 
-    pub token_program: Program<'info, Token>,
+    pub base_token_program: Interface<'info, TokenInterface>,
+    pub quote_token_program: Program<'info, Token>,
     pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,
-    // Pumpswap accounts passed via remaining_accounts (same as OpenPosition)
 }
 
 #[derive(Accounts)]
@@ -1564,11 +1553,16 @@ pub struct Liquidate<'info> {
     #[account(mut, seeds = [b"lending_pool", market.key().as_ref()], bump = lending_pool.bump)]
     pub lending_pool: Box<Account<'info, LendingPool>>,
 
-    #[account(mut, associated_token::mint = token_mint, associated_token::authority = protocol_vault)]
-    pub token_vault: Box<Account<'info, TokenAccount>>,
+    #[account(
+        mut,
+        associated_token::mint = token_mint,
+        associated_token::authority = protocol_vault,
+        associated_token::token_program = base_token_program,
+    )]
+    pub token_vault: Box<InterfaceAccount<'info, TokenAccount>>,
 
     #[account(mut, associated_token::mint = wsol_mint, associated_token::authority = protocol_vault)]
-    pub wsol_vault: Box<Account<'info, TokenAccount>>,
+    pub wsol_vault: Box<InterfaceAccount<'info, TokenAccount>>,
 
     #[account(
         mut, close = position_owner,
@@ -1577,16 +1571,16 @@ pub struct Liquidate<'info> {
     )]
     pub position: Box<Account<'info, Position>>,
 
-    pub token_mint: Box<Account<'info, Mint>>,
+    pub token_mint: Box<InterfaceAccount<'info, Mint>>,
 
     /// CHECK: WSOL mint
     #[account(address = WSOL_MINT)]
     pub wsol_mint: AccountInfo<'info>,
 
-    pub token_program: Program<'info, Token>,
+    pub base_token_program: Interface<'info, TokenInterface>,
+    pub quote_token_program: Program<'info, Token>,
     pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,
-    // Pumpswap accounts passed via remaining_accounts (same as OpenPosition)
 }
 
 // ========== State ==========
@@ -1608,6 +1602,7 @@ pub struct Market {
     pub total_short_collateral: u64,
     pub total_positions: u64,
     pub max_position_size: u64,
+    pub token_decimals: u8,
     pub bump: u8,
 }
 
@@ -1687,9 +1682,7 @@ pub struct LendingDeposited { pub user: Pubkey, pub amount: u64, pub shares: u64
 pub struct LendingWithdrawn { pub user: Pubkey, pub tokens: u64, pub shares: u64 }
 
 #[event]
-pub struct MarketClosed {
-    pub token_mint: Pubkey,
-}
+pub struct MarketClosed { pub token_mint: Pubkey }
 
 #[event]
 pub struct PositionOpened {
