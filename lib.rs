@@ -340,7 +340,7 @@ pub mod perpe {
         let vault_bump = ctx.accounts.protocol.vault_bump;
 
         if is_long {
-            let tokens = execute_buy(
+            let (tokens, sol_spent) = execute_buy(
                 &ctx.accounts.protocol_vault,
                 &ctx.accounts.token_vault,
                 &ctx.accounts.wsol_vault,
@@ -369,14 +369,14 @@ pub mod perpe {
                 slippage_limit,
             )?;
 
-            let actual_entry_price = (position_size_sol as u128)
+            let actual_entry_price = (sol_spent as u128)
                 .checked_mul(PRECISION)
                 .ok_or(ErrorCode::Overflow)?
                 .checked_div(tokens as u128)
                 .ok_or(ErrorCode::Overflow)? as u64;
         
             position.token_amount = tokens;
-            position.position_size_sol = position_size_sol;
+            position.position_size_sol = sol_spent;
             position.borrowed_tokens = 0;
             position.entry_price = actual_entry_price;
             position.liquidation_price = calc_liq_price_long(actual_entry_price, leverage)?;
@@ -817,7 +817,7 @@ fn execute_buy<'info>(
     vault_bump: u8,
     sol_amount: u64,
     min_tokens: u64,
-) -> Result<u64> {
+) -> Result<(u64, u64)> {
     let vault_bump_slice = &[vault_bump];
     let vault_seeds: &[&[u8]] = &[b"protocol_vault", vault_bump_slice];
     let vault_signer_seeds = &[vault_seeds];
@@ -844,6 +844,7 @@ fn execute_buy<'info>(
     )?;
 
     let tokens_before = token_vault.amount;
+    let wsol_before = wsol_vault.amount;
 
     let mut ix_data = Vec::with_capacity(25);
     ix_data.extend_from_slice(&BUY_DISCRIMINATOR);
@@ -911,11 +912,19 @@ fn execute_buy<'info>(
     let token_vault_data = token_vault_info.try_borrow_data()?;
     let tokens_after = u64::from_le_bytes(token_vault_data[TOKEN_AMOUNT_OFFSET..TOKEN_AMOUNT_OFFSET + 8].try_into().unwrap());
     drop(token_vault_data);
-    
-    let received = tokens_after.checked_sub(tokens_before).ok_or(ErrorCode::SwapFailed)?;
-    require!(received >= min_tokens, ErrorCode::SlippageExceeded);
 
-    Ok(received)
+    let wsol_vault_info = wsol_vault.to_account_info();
+    let wsol_vault_data = wsol_vault_info.try_borrow_data()?;
+    let wsol_after = u64::from_le_bytes(wsol_vault_data[TOKEN_AMOUNT_OFFSET..TOKEN_AMOUNT_OFFSET + 8].try_into().unwrap());
+    drop(wsol_vault_data);
+    
+    let tokens_received = tokens_after.checked_sub(tokens_before).ok_or(ErrorCode::SwapFailed)?;
+    let sol_spent = wsol_before.checked_add(sol_amount).ok_or(ErrorCode::Overflow)?
+        .checked_sub(wsol_after).ok_or(ErrorCode::SwapFailed)?;
+    
+    require!(tokens_received >= min_tokens, ErrorCode::SlippageExceeded);
+
+    Ok((tokens_received, sol_spent))
 }
 
 #[allow(clippy::too_many_arguments)]
