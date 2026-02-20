@@ -1063,6 +1063,27 @@ fn execute_buy_for_close<'info>(
 
     let wsol_before = wsol_vault.amount;
 
+    anchor_lang::system_program::transfer(
+        CpiContext::new_with_signer(
+            system_program.to_account_info(),
+            anchor_lang::system_program::Transfer {
+                from: protocol_vault.to_account_info(),
+                to: wsol_vault.to_account_info(),
+            },
+            signer_seeds,
+        ),
+        max_sol,
+    )?;
+
+    token::sync_native(
+        CpiContext::new(
+            quote_token_program.to_account_info(),
+            SyncNative {
+                account: wsol_vault.to_account_info(),
+            },
+        ),
+    )?;
+
     let mut ix_data = Vec::with_capacity(25);
     ix_data.extend_from_slice(&BUY_DISCRIMINATOR);
     ix_data.extend_from_slice(&tokens_to_buy.to_le_bytes());
@@ -1130,7 +1151,8 @@ fn execute_buy_for_close<'info>(
     let wsol_after = u64::from_le_bytes(wsol_vault_data[TOKEN_AMOUNT_OFFSET..TOKEN_AMOUNT_OFFSET + 8].try_into().unwrap());
     drop(wsol_vault_data);
     
-    let spent = wsol_before.checked_sub(wsol_after).ok_or(ErrorCode::SwapFailed)?;
+    let spent = wsol_before.checked_add(max_sol).ok_or(ErrorCode::Overflow)?
+        .checked_sub(wsol_after).ok_or(ErrorCode::SwapFailed)?;
     require!(spent <= max_sol, ErrorCode::SlippageExceeded);
 
     Ok(spent)
